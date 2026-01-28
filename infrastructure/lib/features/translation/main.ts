@@ -11,6 +11,7 @@ import {
 	aws_stepfunctions as sfn,
 	aws_iam as iam,
 	aws_stepfunctions_tasks as tasks,
+	aws_ssm as ssm,
 } from "aws-cdk-lib";
 import { dt_stepfunction } from "../../components/stepfunction";
 
@@ -22,6 +23,7 @@ export interface props {
 	sfnTranslate: sfn.StateMachine;
 	sfnPii?: sfn.StateMachine;
 	sfnTag?: sfn.StateMachine;
+	contentBucketName: string;
 }
 
 export class dt_translationMain extends Construct {
@@ -76,6 +78,60 @@ export class dt_translationMain extends Construct {
 				},
 			},
 		});
+		
+		// STATE MACHINE | MAIN | TASKS | PREPROCESSING HOOK
+		// Read preprocessing configuration from Parameter Store
+		const getPreprocessingEnabled = new tasks.CallAwsService(
+			this,
+			"getPreprocessingEnabled",
+			{
+				service: "ssm",
+				action: "getParameter",
+				parameters: {
+					Name: "/doctran/main/app/translation/preprocessing/enable",
+				},
+				iamResources: ["*"],
+				resultPath: "$.preprocessingConfig.enabled",
+			},
+		);
+
+		const getPreprocessingStateMachineArn = new tasks.CallAwsService(
+			this,
+			"getPreprocessingStateMachineArn",
+			{
+				service: "ssm",
+				action: "getParameter",
+				parameters: {
+					Name: "/doctran/main/app/translation/preprocessing/stateMachineArn",
+				},
+				iamResources: ["*"],
+				resultPath: "$.preprocessingConfig.stateMachineArn",
+			},
+		);
+
+		// Call preprocessing Step Function if enabled
+		const callPreprocessingHook = new tasks.StepFunctionsStartExecution(
+			this,
+			"callPreprocessingHook",
+			{
+				stateMachine: sfn.StateMachine.fromStateMachineArn(
+					this,
+					"PreprocessingStateMachine",
+					sfn.JsonPath.stringAt(
+						"$.preprocessingConfig.stateMachineArn.Parameter.Value",
+					),
+				),
+				integrationPattern: sfn.IntegrationPattern.RUN_JOB,
+				input: sfn.TaskInput.fromObject({
+					bucket: props.contentBucketName,
+					key: sfn.JsonPath.stringAt("$.jobDetails.s3PrefixToObject"),
+					identity: sfn.JsonPath.stringAt("$.jobDetails.jobIdentity"),
+					jobId: sfn.JsonPath.stringAt("$.jobDetails.jobId"),
+				}),
+				resultPath: "$.preprocessingResult",
+			},
+		);
+
 		// STATE MACHINE | MAIN | TASKS | startSfnTranslate
 		const startSfnTranslate = new tasks.StepFunctionsStartExecution(
 			this,
@@ -135,7 +191,47 @@ export class dt_translationMain extends Construct {
 		);
 
 		// STATE MACHINE | MAIN | DEF
+		// Create preprocessing choice state
+		const isPreprocessingEnabled = new sfn.Choice(
+			this,
+			"isPreprocessingEnabled",
+		)
+			.when(
+				sfn.Condition.stringEquals(
+					"$.preprocessingConfig.enabled.Parameter.Value",
+					"true",
+				),
+				callPreprocessingHook,
+			)
+			.otherwise(
+				new sfn.Pass(this, "skipPreprocessing", {
+					comment: "Preprocessing disabled, skip to translation",
+				}),
+			);
+
+		// Connect preprocessing hook to mainParallel
+		callPreprocessingHook.next(
+			new sfn.Pass(this, "afterPreprocessing", {
+				comment: "Continue to translation after preprocessing",
+			}),
+		);
+
 		if (startSfnPii && startSfnTag) {
+			const mainParallel = new sfn.Parallel(this, "mainParallel", {
+				resultPath: "$.mainParallel",
+			})
+				// P1 SfnTranslate
+				.branch(startSfnTranslate)
+				// P2 SfnPii
+				.branch(startSfnPii);
+
+			// Wire preprocessing to mainParallel
+			isPreprocessingEnabled
+				.afterwards()
+				.next(mainParallel)
+				.next(startSfnTag)
+				.next(updateDbJobStatus);
+
 			this.sfnMain = new dt_stepfunction(
 				this,
 				`${cdk.Stack.of(this).stackName}_TranslationMain`,
@@ -144,21 +240,24 @@ export class dt_translationMain extends Construct {
 					removalPolicy: props.removalPolicy,
 					definition: unNestJobDetails
 						.next(mapJobDetails)
-						.next(
-							// PARRLLEL CONDITIONAL
-							new sfn.Parallel(this, "mainParallel", {
-								resultPath: "$.mainParallel",
-							})
-								// P1 SfnTranslate
-								.branch(startSfnTranslate)
-								// P2 SfnPii
-								.branch(startSfnPii),
-						)
-						.next(startSfnTag)
-						.next(updateDbJobStatus),
+						.next(getPreprocessingEnabled)
+						.next(getPreprocessingStateMachineArn)
+						.next(isPreprocessingEnabled),
 				},
 			).StateMachine;
 		} else {
+			const mainParallel = new sfn.Parallel(this, "mainParallel", {
+				resultPath: "$.mainParallel",
+			})
+				// P1 SfnTranslate
+				.branch(startSfnTranslate);
+
+			// Wire preprocessing to mainParallel
+			isPreprocessingEnabled
+				.afterwards()
+				.next(mainParallel)
+				.next(updateDbJobStatus);
+
 			this.sfnMain = new dt_stepfunction(
 				this,
 				`${cdk.Stack.of(this).stackName}_TranslationMain`,
@@ -167,15 +266,9 @@ export class dt_translationMain extends Construct {
 					removalPolicy: props.removalPolicy,
 					definition: unNestJobDetails
 						.next(mapJobDetails)
-						.next(
-							// PARRLLEL CONDITIONAL
-							new sfn.Parallel(this, "mainParallel", {
-								resultPath: "$.mainParallel",
-							})
-								// P1 SfnTranslate
-								.branch(startSfnTranslate),
-						)
-						.next(updateDbJobStatus),
+						.next(getPreprocessingEnabled)
+						.next(getPreprocessingStateMachineArn)
+						.next(isPreprocessingEnabled),
 				},
 			).StateMachine;
 		}

@@ -495,6 +495,7 @@ export class dt_translate extends Construct {
 				sfnTranslate: featTranslationTranslate.sfnMain,
 				sfnPii,
 				sfnTag,
+				contentBucketName: this.contentBucket.bucketName,
 			},
 		);
 		handleErrorsFromSfnArns.push(featTranslationMain.sfnMain.stateMachineArn);
