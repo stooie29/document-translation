@@ -109,28 +109,92 @@ export class dt_translationMain extends Construct {
 			},
 		);
 
-		// Call preprocessing Step Function if enabled
-		const callPreprocessingHook = new tasks.StepFunctionsStartExecution(
+		// Call preprocessing Step Function if enabled using StartExecution task
+		const callPreprocessingHook = new tasks.CallAwsService(
 			this,
 			"callPreprocessingHook",
 			{
-				stateMachine: sfn.StateMachine.fromStateMachineArn(
-					this,
-					"PreprocessingStateMachine",
-					sfn.JsonPath.stringAt(
+				service: "sfn",
+				action: "startExecution",
+				parameters: {
+					StateMachineArn: sfn.JsonPath.stringAt(
 						"$.preprocessingConfig.stateMachineArn.Parameter.Value",
 					),
-				),
-				integrationPattern: sfn.IntegrationPattern.RUN_JOB,
-				input: sfn.TaskInput.fromObject({
-					bucket: props.contentBucketName,
-					key: sfn.JsonPath.stringAt("$.jobDetails.s3PrefixToObject"),
-					identity: sfn.JsonPath.stringAt("$.jobDetails.jobIdentity"),
-					jobId: sfn.JsonPath.stringAt("$.jobDetails.jobId"),
-				}),
-				resultPath: "$.preprocessingResult",
+					Input: sfn.JsonPath.objectAt("$.preprocessingInput"),
+				},
+				iamResources: ["*"],
+				resultPath: "$.preprocessingExecution",
 			},
 		);
+
+		// Wait for preprocessing to complete
+		const waitForPreprocessing = new tasks.CallAwsService(
+			this,
+			"waitForPreprocessing",
+			{
+				service: "sfn",
+				action: "describeExecution",
+				parameters: {
+					ExecutionArn: sfn.JsonPath.stringAt(
+						"$.preprocessingExecution.ExecutionArn",
+					),
+				},
+				iamResources: ["*"],
+				resultPath: "$.preprocessingStatus",
+			},
+		);
+
+		// Check if preprocessing is complete
+		const checkPreprocessingStatus = new sfn.Choice(
+			this,
+			"checkPreprocessingStatus",
+		)
+			.when(
+				sfn.Condition.stringEquals("$.preprocessingStatus.Status", "SUCCEEDED"),
+				new sfn.Pass(this, "preprocessingComplete"),
+			)
+			.when(
+				sfn.Condition.stringEquals("$.preprocessingStatus.Status", "FAILED"),
+				new sfn.Fail(this, "preprocessingFailed", {
+					error: "PreprocessingFailed",
+					cause: "Preprocessing Step Function execution failed",
+				}),
+			)
+			.when(
+				sfn.Condition.stringEquals("$.preprocessingStatus.Status", "TIMED_OUT"),
+				new sfn.Fail(this, "preprocessingTimedOut", {
+					error: "PreprocessingTimedOut",
+					cause: "Preprocessing Step Function execution timed out",
+				}),
+			)
+			.otherwise(
+				new sfn.Wait(this, "waitForPreprocessingCompletion", {
+					time: sfn.WaitTime.duration(cdk.Duration.seconds(5)),
+				}).next(waitForPreprocessing),
+			);
+
+		waitForPreprocessing.next(checkPreprocessingStatus);
+
+		// Prepare preprocessing input
+		const preparePreprocessingInput = new sfn.Pass(
+			this,
+			"preparePreprocessingInput",
+			{
+				parameters: {
+					preprocessingInput: {
+						bucket: props.contentBucketName,
+						key: sfn.JsonPath.stringAt("$.jobDetails.s3PrefixToObject"),
+						identity: sfn.JsonPath.stringAt("$.jobDetails.jobIdentity"),
+						jobId: sfn.JsonPath.stringAt("$.jobDetails.jobId"),
+					},
+					preprocessingConfig: sfn.JsonPath.objectAt("$.preprocessingConfig"),
+					jobDetails: sfn.JsonPath.objectAt("$.jobDetails"),
+				},
+			},
+		);
+
+		callPreprocessingHook.next(waitForPreprocessing);
+		preparePreprocessingInput.next(callPreprocessingHook);
 
 		// STATE MACHINE | MAIN | TASKS | startSfnTranslate
 		const startSfnTranslate = new tasks.StepFunctionsStartExecution(
@@ -201,20 +265,13 @@ export class dt_translationMain extends Construct {
 					"$.preprocessingConfig.enabled.Parameter.Value",
 					"true",
 				),
-				callPreprocessingHook,
+				preparePreprocessingInput,
 			)
 			.otherwise(
 				new sfn.Pass(this, "skipPreprocessing", {
 					comment: "Preprocessing disabled, skip to translation",
 				}),
 			);
-
-		// Connect preprocessing hook to mainParallel
-		callPreprocessingHook.next(
-			new sfn.Pass(this, "afterPreprocessing", {
-				comment: "Continue to translation after preprocessing",
-			}),
-		);
 
 		if (startSfnPii && startSfnTag) {
 			const mainParallel = new sfn.Parallel(this, "mainParallel", {
